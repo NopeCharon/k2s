@@ -6,8 +6,11 @@ package windowsexporter
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -131,6 +134,7 @@ func TestExporterCollectorConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	var configMap struct {
 		Data map[string]string `yaml:"data"`
 	}
@@ -154,5 +158,44 @@ func TestExporterCollectorConfiguration(t *testing.T) {
 		if !slices.Contains(collectors, required) {
 			t.Errorf("required collector %q missing", required)
 		}
+	}
+}
+
+func TestExporterDashboardMetricCompatibility(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "..", "addons", "monitoring", "manifests", "monitoring", "grafana", "dashboards.yaml")
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	decoder := yaml.NewDecoder(file)
+	removedMetrics := regexp.MustCompile(`\bwindows_cpu_time_total\b|\bwindows_thermalzone_[a-zA-Z0-9_]*\b`)
+	dashboards, cpuQueries := 0, 0
+	for {
+		var configMap struct {
+			Data map[string]string `yaml:"data"`
+		}
+		if err := decoder.Decode(&configMap); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		for name, dashboard := range configMap.Data {
+			if !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			if !json.Valid([]byte(dashboard)) {
+				t.Fatalf("invalid dashboard JSON in %s", name)
+			}
+			dashboards++
+			if metric := removedMetrics.FindString(dashboard); metric != "" {
+				t.Errorf("dashboard %s still references obsolete metric %s", name, metric)
+			}
+			cpuQueries += strings.Count(dashboard, "windows_cpu_time_seconds_total")
+		}
+	}
+	if dashboards == 0 || cpuQueries == 0 {
+		t.Fatalf("expected parsed dashboards and updated Windows CPU queries, got %d dashboards and %d queries", dashboards, cpuQueries)
 	}
 }

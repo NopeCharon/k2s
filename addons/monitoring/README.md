@@ -22,7 +22,9 @@ The Windows Exporter acceptance suite requires a successful ServiceMonitor scrap
 for every Windows node, not merely a discovered target with `up=0`. On failure,
 it records exporter configuration, pod status/logs, endpoints, and the exporter
 targets' Prometheus scrape errors before addon cleanup.
-Its CPU check uses the 0.32 metric name `windows_cpu_time_seconds_total`.
+Its CPU check and the bundled Grafana CPU queries use the 0.32 metric name
+`windows_cpu_time_seconds_total`. Bundled dashboards do not query removed
+`windows_thermalzone_*` metrics.
 
 ## Grafana License Compliance
 
