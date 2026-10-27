@@ -75,7 +75,7 @@ BeforeAll {
     $kubeconfigFunctionNames = @(
         'Add-K8sContext', 'ConvertTo-KubectlArgumentString', 'Invoke-KubeconfigKubectl', 'Invoke-KubeconfigKubectlChecked',
         'Assert-KubeconfigBytes', 'Get-KubeconfigObject', 'Get-KubeconfigNamedEntries', 'Assert-MergedKubeconfig',
-        'Write-KubeconfigStagingFile', 'Publish-KubeconfigFile')
+        'Write-KubeconfigStagingFile', 'Publish-KubeconfigFile', 'Assert-K2sCredentialData', 'Invoke-KubeconfigFileReplace', 'Test-KubeconfigFileUnchanged')
     $kubeconfigFunctions = $moduleAst.FindAll({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $kubeconfigFunctionNames -contains $node.Name
@@ -84,6 +84,7 @@ BeforeAll {
         . ([scriptblock]::Create($function.Extent.Text))
     }
     $script:realWriteKubeconfigStagingFile = ${function:Write-KubeconfigStagingFile}
+    $script:realInvokeKubeconfigFileReplace = ${function:Invoke-KubeconfigFileReplace}
 
     function Write-Log { param($Message, [switch]$Console) }
     function Get-InstalledClusterName { 'k2s-cluster' }
@@ -98,20 +99,27 @@ BeforeAll {
         $random.NextBytes($buffer)
         return [Convert]::ToBase64String($buffer)
     }
+    # Synthetic PEM (random body) encoded as base64, like kubeadm certificate/key data.
+    function New-PemData([int]$Seed, [int]$Length, [string]$Label) {
+        $body = New-Base64Data -Seed $Seed -Length $Length
+        $lines = for ($i = 0; $i -lt $body.Length; $i += 64) { $body.Substring($i, [Math]::Min(64, $body.Length - $i)) }
+        $pem = "-----BEGIN $Label-----`n" + ($lines -join "`n") + "`n-----END $Label-----`n"
+        return [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pem))
+    }
     $eAcute = [string][char]0x00E9
     $uUmlaut = [string][char]0x00FC
     $oUmlaut = [string][char]0x00F6
     $tokyo = [string][char]0x6771 + [char]0x4EAC
     $script:aksClusterName = "aks-prod-m${uUmlaut}nchen"
-    $script:aksUserName = "clusterUser_rg_j${oUmlaut}rg"
-    $script:aksContextName = "aks-${eAcute}quipe@$tokyo"
+    $script:aksUserName = "clusterUser_rg_J${oUmlaut}rg"
+    $script:aksContextName = "aks-Andr${eAcute}@$tokyo"
     $script:aksNamespace = "team-${uUmlaut}${oUmlaut}${eAcute}"
 
     function New-K2sCluster([int]$Seed) {
-        [ordered]@{ name = 'k2s-cluster'; cluster = [ordered]@{ 'certificate-authority-data' = (New-Base64Data -Seed $Seed -Length 1100); server = 'https://172.19.1.100:6443' } }
+        [ordered]@{ name = 'k2s-cluster'; cluster = [ordered]@{ 'certificate-authority-data' = (New-PemData -Seed $Seed -Length 800 -Label 'CERTIFICATE'); server = 'https://172.19.1.100:6443' } }
     }
     function New-K2sUser([int]$Seed) {
-        [ordered]@{ name = 'kubernetes-admin'; user = [ordered]@{ 'client-certificate-data' = (New-Base64Data -Seed ($Seed + 1) -Length 1150); 'client-key-data' = (New-Base64Data -Seed ($Seed + 2) -Length 1680) } }
+        [ordered]@{ name = 'kubernetes-admin'; user = [ordered]@{ 'client-certificate-data' = (New-PemData -Seed ($Seed + 1) -Length 850 -Label 'CERTIFICATE'); 'client-key-data' = (New-PemData -Seed ($Seed + 2) -Length 1190 -Label 'RSA PRIVATE KEY') } }
     }
     function New-K2sContext {
         [ordered]@{ name = $script:k2sContextName; context = [ordered]@{ cluster = 'k2s-cluster'; user = 'kubernetes-admin' } }
@@ -496,6 +504,378 @@ Describe 'Add-K8sContext safe kubeconfig merge (fake kubectl)' -Tag 'unit', 'ci'
         ConvertTo-KubectlArgumentString -Arguments @('config', 'view', '--kubeconfig', 'C:\Users\J Doe\.kube\config') | Should -BeExactly 'config view --kubeconfig "C:\Users\J Doe\.kube\config"'
         ConvertTo-KubectlArgumentString -Arguments @('a"b', 'C:\dir with space\', '') | Should -BeExactly '"a\"b" "C:\dir with space\\" ""'
     }
+
+    It 'repairs the user kubeconfig states observed on an affected machine (<Case>)' -ForEach @(
+        @{ Case = '0-byte config'; Content = '' }
+        @{ Case = 'config with null clusters/users/contexts'; Content = '{"apiVersion":"v1","clusters":null,"contexts":null,"current-context":"kubernetes-admin@k2s-cluster","kind":"Config","users":null}' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content $Content
+
+        Add-K8sContext
+
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath | Out-Null
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes -Because 'config_backup must hold the pre-update content'
+        Assert-NoTemporaryFiles
+    }
+
+    It 'fresh install does not overwrite a kubeconfig created by another process during the update' {
+        $script:concurrent = New-UserKubeconfigText -CurrentContext 'docker-desktop'
+        Mock Write-KubeconfigStagingFile {
+            & $script:realWriteKubeconfigStagingFile -Path $Path -Bytes $Bytes
+            Write-TestFile -Path $script:userKubeconfig -Content $script:concurrent
+        }
+
+        { Add-K8sContext } | Should -Throw '*created by another process*'
+
+        [System.IO.File]::ReadAllText($script:userKubeconfig) | Should -BeExactly $script:concurrent
+        Test-Path $script:backupKubeconfig | Should -BeFalse
+        Assert-NoTemporaryFiles
+        $env:KUBECONFIG | Should -BeNullOrEmpty
+    }
+
+    It 'leaves the user kubeconfig unchanged when it cannot be read (exclusively locked)' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $lock = New-Object System.IO.FileStream($script:userKubeconfig, 'Open', 'Read', 'None')
+        try {
+            { Add-K8sContext } | Should -Throw
+        }
+        finally {
+            $lock.Dispose()
+        }
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'keeps the original when another process holds the destination open for <Access> at replacement time' -ForEach @(
+        @{ Access = 'Read'; Expected = '*replacing*left unchanged*' }
+        @{ Access = 'ReadWrite'; Expected = '*in use by another process*' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:lockAccess = $Access
+        $script:lockHandle = $null
+        Mock Write-KubeconfigStagingFile {
+            & $script:realWriteKubeconfigStagingFile -Path $Path -Bytes $Bytes
+            $script:lockHandle = New-Object System.IO.FileStream($script:userKubeconfig, 'Open', $script:lockAccess, 'ReadWrite')
+        }
+        try {
+            { Add-K8sContext } | Should -Throw $Expected
+        }
+        finally {
+            if ($script:lockHandle) { $script:lockHandle.Dispose() }
+        }
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'blocks in-place writers between the change check and the swap' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:writerResult = $null
+        Mock Invoke-KubeconfigFileReplace {
+            try { [System.IO.File]::WriteAllText($Path, 'concurrent writer'); $script:writerResult = 'written' } catch { $script:writerResult = 'blocked' }
+            & $script:realInvokeKubeconfigFileReplace -StagingPath $StagingPath -Path $Path -BackupPath $BackupPath
+        }
+
+        Add-K8sContext
+
+        $script:writerResult | Should -Be 'blocked'
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath -OriginalParsed (Get-KubeconfigObject -KubectlPath $script:fakeKubectlPath -Path $script:backupKubeconfig) `
+            -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+        Assert-NoTemporaryFiles
+    }
+
+    It 'restores the original when File.Replace fails after moving it to the backup name' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        # Simulates ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: target already renamed to the backup name, replacement not moved.
+        Mock Invoke-KubeconfigFileReplace {
+            [System.IO.File]::Delete($BackupPath)
+            [System.IO.File]::Move($Path, $BackupPath)
+            throw (New-Object System.IO.IOException 'simulated ERROR_UNABLE_TO_MOVE_REPLACEMENT_2')
+        }
+
+        { Add-K8sContext } | Should -Throw '*original was restored*'
+
+        Get-FileBase64 $script:userKubeconfig | Should -BeExactly $script:originalUserBytes
+        Test-Path $script:backupKubeconfig | Should -BeFalse -Because 'ReplaceFile already overwrote the previous backup; it is moved back to config'
+        Assert-NoTemporaryFiles
+        $env:KUBECONFIG | Should -BeNullOrEmpty
+    }
+
+    It 'reports where the original is preserved when it cannot be moved back' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        Mock Invoke-KubeconfigFileReplace {
+            [System.IO.File]::Delete($BackupPath)
+            [System.IO.File]::Move($Path, $BackupPath)
+            New-Item -ItemType Directory -Path $Path | Out-Null
+            throw (New-Object System.IO.IOException 'simulated ERROR_UNABLE_TO_MOVE_REPLACEMENT_2')
+        }
+
+        try {
+            { Add-K8sContext } | Should -Throw '*preserved in*config_backup*'
+            Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes
+            @(Get-ChildItem -LiteralPath $script:kubeConfigDir -Force -Filter 'config.k2s-*').Count | Should -Be 0
+        }
+        finally {
+            Remove-Item -LiteralPath $script:userKubeconfig -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'retries a transient ERROR_UNABLE_TO_REMOVE_REPLACED and then replaces the user kubeconfig' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:replaceCalls = 0
+        Mock Start-Sleep {}
+        Mock Invoke-KubeconfigFileReplace {
+            $script:replaceCalls++
+            if ($script:replaceCalls -le 2) { throw (New-Object System.IO.IOException 'Unable to remove the file to be replaced.') }
+            & $script:realInvokeKubeconfigFileReplace -StagingPath $StagingPath -Path $Path -BackupPath $BackupPath
+        }
+
+        Add-K8sContext
+
+        $script:replaceCalls | Should -Be 3
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath -OriginalParsed (Get-KubeconfigObject -KubectlPath $script:fakeKubectlPath -Path $script:backupKubeconfig) `
+            -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+        Assert-NoTemporaryFiles
+    }
+
+    It 'gives up after the retry limit for a persistent IO error and keeps the user kubeconfig' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:replaceCalls = 0
+        Mock Start-Sleep {}
+        Mock Invoke-KubeconfigFileReplace { $script:replaceCalls++; throw (New-Object System.IO.IOException 'Unable to remove the file to be replaced.') }
+
+        { Add-K8sContext } | Should -Throw '*replacing*left unchanged*Unable to remove*'
+
+        $script:replaceCalls | Should -Be 5
+        Assert-UserKubeconfigUnchanged
+        Assert-NoTemporaryFiles
+        $env:KUBECONFIG | Should -BeNullOrEmpty
+    }
+
+    It 'does not retry a non-transient replace error (access denied)' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:replaceCalls = 0
+        Mock Start-Sleep {}
+        Mock Invoke-KubeconfigFileReplace { $script:replaceCalls++; throw (New-Object System.UnauthorizedAccessException 'Access to the path is denied.') }
+
+        { Add-K8sContext } | Should -Throw '*replacing*left unchanged*denied*'
+
+        $script:replaceCalls | Should -Be 1
+        Assert-UserKubeconfigUnchanged
+        Assert-NoTemporaryFiles
+    }
+
+    It 'does not retry over a user kubeconfig that another process replaced after a failed attempt' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:replaceCalls = 0
+        $script:concurrent = "apiVersion: v1`nkind: Config`ncurrent-context: other-writer`n"
+        Mock Start-Sleep {}
+        Mock Invoke-KubeconfigFileReplace {
+            $script:replaceCalls++
+            $other = "$Path.other-writer"
+            [System.IO.File]::WriteAllText($other, $script:concurrent)
+            [System.IO.File]::Replace($other, $Path, [NullString]::Value)
+            throw (New-Object System.IO.IOException 'Unable to remove the file to be replaced.')
+        }
+
+        { Add-K8sContext } | Should -Throw '*modified by another process*'
+
+        $script:replaceCalls | Should -Be 1
+        [System.IO.File]::ReadAllText($script:userKubeconfig) | Should -BeExactly $script:concurrent
+        Assert-NoTemporaryFiles
+    }
+
+    It 'rejects a K2s kubeconfig whose credential data is <Case> and keeps the user kubeconfig' -ForEach @(
+        @{ Case = 'truncated PEM (valid base64)'; Expected = '*incomplete PEM*'; Mutate = { param($v) $v.Substring(0, $v.Length - 400) } }
+        @{ Case = 'truncated base64'; Expected = '*not base64*'; Mutate = { param($v) $v.Substring(0, $v.Length - 3) } }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $user = New-K2sUser 1
+        $user.user['client-key-data'] = & $Mutate $user.user['client-key-data']
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @(New-K2sCluster 1) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw $Expected
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'rejects a K2s kubeconfig whose <Field> is <State> and keeps the user kubeconfig and backup' -ForEach @(
+        foreach ($f in @('certificate-authority-data', 'client-certificate-data', 'client-key-data')) {
+            foreach ($s in @('missing', 'null', 'empty', 'whitespace')) { @{ Field = $f; State = $s } }
+        }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $cluster = New-K2sCluster 1
+        $user = New-K2sUser 1
+        $target = if ($Field -eq 'certificate-authority-data') { $cluster.cluster } else { $user.user }
+        switch ($State) {
+            'missing' { $target.Remove($Field) }
+            'null' { $target[$Field] = $null }
+            'empty' { $target[$Field] = '' }
+            'whitespace' { $target[$Field] = '   ' }
+        }
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @($cluster) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw "*has no $Field*"
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'does not create a user kubeconfig on fresh install when client-key-data is missing' {
+        $user = New-K2sUser 1
+        $user.user.Remove('client-key-data')
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @(New-K2sCluster 1) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw '*has no client-key-data*'
+
+        Test-Path $script:userKubeconfig | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:kubeConfigDir -Force -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+
+    It 'rejects a K2s kubeconfig without the K2s <Kind> entry and keeps the user kubeconfig' -ForEach @(
+        @{ Kind = 'cluster' }, @{ Kind = 'user' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $clusters = if ($Kind -eq 'cluster') { @() } else { @(New-K2sCluster 1) }
+        $users = if ($Kind -eq 'user') { @() } else { @(New-K2sUser 1) }
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters $clusters -Users $users -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw "*has no $Kind*"
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'rejects K2s credential data with <Case> and keeps the user kubeconfig' -ForEach @(
+        @{ Case = 'mismatched BEGIN/END labels (equal counts)'; Field = 'client-key-data'; Pem = "-----BEGIN RSA PRIVATE KEY-----`nQUJD`n-----END CERTIFICATE-----`n"; Expected = '*incomplete PEM*mismatched*' }
+        @{ Case = 'labels crossed between two blocks'; Field = 'client-certificate-data'; Pem = "-----BEGIN CERTIFICATE-----`nQUJD`n-----END RSA PRIVATE KEY-----`n-----BEGIN RSA PRIVATE KEY-----`nQUJD`n-----END CERTIFICATE-----`n"; Expected = '*incomplete PEM*' }
+        @{ Case = 'an unterminated second block'; Field = 'certificate-authority-data'; Pem = "-----BEGIN CERTIFICATE-----`nQUJD`n-----END CERTIFICATE-----`n-----BEGIN CERTIFICATE-----`nQUJD`n"; Expected = '*incomplete PEM*' }
+        @{ Case = 'text after the END marker'; Field = 'client-certificate-data'; Pem = "-----BEGIN CERTIFICATE-----`nQUJD`n-----END CERTIFICATE-----`ngarbage`n"; Expected = '*incomplete PEM*' }
+        @{ Case = 'no PEM markers'; Field = 'certificate-authority-data'; Pem = "not a certificate`n"; Expected = '*incomplete PEM*' }
+        @{ Case = 'a certificate in client-key-data'; Field = 'client-key-data'; Pem = "-----BEGIN CERTIFICATE-----`nQUJD`n-----END CERTIFICATE-----`n"; Expected = '*unexpected PEM blocks*' }
+        @{ Case = 'a private key in certificate-authority-data'; Field = 'certificate-authority-data'; Pem = "-----BEGIN RSA PRIVATE KEY-----`nQUJD`n-----END RSA PRIVATE KEY-----`n"; Expected = '*unexpected PEM blocks*' }
+        @{ Case = 'two private keys'; Field = 'client-key-data'; Pem = "-----BEGIN RSA PRIVATE KEY-----`nQUJD`n-----END RSA PRIVATE KEY-----`n-----BEGIN RSA PRIVATE KEY-----`nQUJD`n-----END RSA PRIVATE KEY-----`n"; Expected = '*unexpected PEM blocks*' }
+        @{ Case = 'a corrupt PEM body'; Field = 'client-certificate-data'; Pem = "-----BEGIN CERTIFICATE-----`nQUJ=D`n-----END CERTIFICATE-----`n"; Expected = '*corrupt PEM body*' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $cluster = New-K2sCluster 1
+        $user = New-K2sUser 1
+        $target = if ($Field -eq 'certificate-authority-data') { $cluster.cluster } else { $user.user }
+        $target[$Field] = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($Pem))
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @($cluster) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw $Expected
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'accepts a <Label> client key and a CA bundle' -ForEach @(
+        @{ Label = 'RSA PRIVATE KEY' }, @{ Label = 'EC PRIVATE KEY' }, @{ Label = 'PRIVATE KEY' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $originalParsed = Get-KubeconfigObject -KubectlPath $script:fakeKubectlPath -Path $script:userKubeconfig
+        $cluster = New-K2sCluster 1
+        $bundle = @(2, 3) | ForEach-Object { [System.Text.Encoding]::ASCII.GetString([Convert]::FromBase64String((New-PemData -Seed $_ -Length 500 -Label 'CERTIFICATE'))) }
+        $cluster.cluster['certificate-authority-data'] = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes(($bundle -join '')))
+        $user = New-K2sUser 1
+        $user.user['client-key-data'] = New-PemData -Seed 7 -Length 300 -Label $Label
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @($cluster) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        Add-K8sContext
+
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath -OriginalParsed $originalParsed `
+            -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+    }
+
+    It 'does not present an older config_backup as the original when the target vanished during replacement' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:replaceCalls = 0
+        Mock Start-Sleep {}
+        Mock Invoke-KubeconfigFileReplace {
+            $script:replaceCalls++
+            [System.IO.File]::Delete($Path)
+            throw (New-Object System.IO.FileNotFoundException 'simulated: target deleted by another process')
+        }
+
+        { Add-K8sContext } | Should -Throw '*does not hold its original content*nothing was restored*'
+
+        $script:replaceCalls | Should -Be 1
+        Test-Path $script:userKubeconfig | Should -BeFalse
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalBackupBytes -Because 'the older backup must not be moved to config'
+        Assert-NoTemporaryFiles
+    }
+
+    It 'does not fail after commit when the informational config view fails' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $originalParsed = Get-KubeconfigObject -KubectlPath $script:fakeKubectlPath -Path $script:userKubeconfig
+        $script:fault = @{ Mode = 'fail'; Match = { param($a, $k) $a[1] -eq 'view' -and $a -notcontains '--raw' } }
+
+        Add-K8sContext
+
+        $script:fault = $null
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath -OriginalParsed $originalParsed `
+            -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes
+        Assert-NoTemporaryFiles
+    }
+
+    It 'warns when a foreign context references the K2s user name and keeps that context' {
+        $clusters = @(New-ForeignClusters) + [ordered]@{ name = 'other-kubeadm'; cluster = [ordered]@{ server = 'https://10.0.0.1:6443' } }
+        $contexts = @(New-ForeignContexts) + [ordered]@{ name = 'kubernetes-admin@other-kubeadm'; context = [ordered]@{ cluster = 'other-kubeadm'; user = 'kubernetes-admin' } }
+        Initialize-ExistingUserKubeconfig -Content (New-KubeconfigText -Clusters (@($clusters) + (New-K2sCluster 900)) -Users (@(New-ForeignUsers) + (New-K2sUser 900)) -Contexts (@($contexts) + (New-K2sContext)) -CurrentContext 'docker-desktop')
+        $originalParsed = Get-KubeconfigObject -KubectlPath $script:fakeKubectlPath -Path $script:userKubeconfig
+        $script:logMessages = New-Object System.Collections.Generic.List[string]
+        Mock Write-Log { $script:logMessages.Add([string]$Message) }
+
+        Add-K8sContext
+
+        @($script:logMessages | Where-Object { $_ -like "*Warning: context 'kubernetes-admin@other-kubeadm'*" }).Count | Should -Be 1
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:fakeKubectlPath -OriginalParsed $originalParsed `
+            -ForeignContexts ($script:foreignContextNames + 'kubernetes-admin@other-kubeadm') -ForeignClusters ($script:foreignClusterNames + 'other-kubeadm') -ForeignUsers $script:foreignUserNames | Out-Null
+    }
+
+    It 'ignores a caller KUBECONFIG and clears it afterwards (as before)' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $decoy = Join-Path $script:testRoot 'decoy-config'
+        $env:KUBECONFIG = $decoy
+
+        Add-K8sContext
+
+        $env:KUBECONFIG | Should -BeNullOrEmpty
+        foreach ($call in $script:kubectlCalls) {
+            $call.Arguments | Should -Not -Contain $decoy
+            ($call.KubeConfig -split ';') | Should -Not -Contain $decoy
+        }
+        Test-Path $decoy | Should -BeFalse
+    }
+}
+
+# Static guards: every Windows path that refreshes the user kubeconfig goes through Add-K8sContext,
+# and no PowerShell code redirects 'kubectl config view' output with '>' / Out-File / Set-Content.
+Describe 'Kubeconfig callers and redirection guard' -Tag 'unit', 'ci', 'cluster' {
+    BeforeAll {
+        $script:repoRoot = [System.IO.Path]::GetFullPath("$PSScriptRoot\..\..\..\..\..\..")
+    }
+
+    It '<Caller> refreshes the user kubeconfig via Copy-KubeConfigFromControlPlaneNode followed by Add-K8sContext' -ForEach @(
+        @{ Caller = 'installation'; File = 'lib\modules\windows\node\k2s.node.module\linuxnode\setup\control-plane-node.module.psm1' }
+        @{ Caller = 'certificate renewal'; File = 'lib\scripts\windows\host\system\certificate\renew.ps1' }
+    ) {
+        $text = [System.IO.File]::ReadAllText((Join-Path $script:repoRoot $File))
+        $text | Should -Match '(?m)^\s*Copy-KubeConfigFromControlPlaneNode\s*\r?\n\s*Add-K8sContext\s*$'
+    }
+
+    It 'no PowerShell file writes kubectl config view output through text redirection' {
+        $offenders = foreach ($dir in @('lib', 'smallsetup', 'addons')) {
+            $path = Join-Path $script:repoRoot $dir
+            if (!(Test-Path $path)) { continue }
+            Get-ChildItem -Path $path -Recurse -File -Include '*.ps1', '*.psm1' |
+                Select-String -Pattern 'config[''"]?\s*,?\s*[''"]?view[^#\r\n]*((?<![\d&])>|\|\s*(Out-File|Set-Content|Add-Content))' |
+                Where-Object { $_.Line -notmatch '^\s*#' } |
+                ForEach-Object { "$($_.Path):$($_.LineNumber)" }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
 }
 
 # Integration suite: exercises Add-K8sContext with the real bin\kube\kubectl.exe (installed by the
@@ -538,14 +918,19 @@ Describe 'Add-K8sContext kubeconfig output (real kubectl)' -Tag 'integration', '
         Assert-NoTemporaryFiles
     }
 
-    It 'repairs a UTF-16LE kubeconfig written by earlier K2s versions' {
-        Initialize-ExistingUserKubeconfig -Content ((New-UserKubeconfigText -CurrentContext $script:k2sContextName -IncludeStaleK2s) -replace "`r?`n", "`r`n") -Encoding ([System.Text.Encoding]::Unicode)
+    It 'repairs a <Case> kubeconfig (e.g. written by earlier K2s versions or editors)' -ForEach @(
+        @{ Case = 'UTF-16LE'; Encoding = [System.Text.Encoding]::Unicode }
+        @{ Case = 'UTF-8 with BOM'; Encoding = (New-Object System.Text.UTF8Encoding($true)) }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content ((New-UserKubeconfigText -CurrentContext $script:k2sContextName -IncludeStaleK2s) -replace "`r?`n", "`r`n") -Encoding $Encoding
         $originalParsed = Get-KubeconfigObject -KubectlPath $script:realKubectlExe -Path $script:userKubeconfig
 
         Add-K8sContext
 
         Assert-UpdatedUserKubeconfig -KubectlPath $script:realKubectlExe -OriginalParsed $originalParsed `
             -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes -Because 'config_backup must hold the original bytes'
+        Assert-NoTemporaryFiles
     }
 
     It 'preserves non-ASCII content regardless of the console output code page' {
@@ -606,5 +991,123 @@ Describe 'Add-K8sContext kubeconfig output (real kubectl)' -Tag 'integration', '
         { Add-K8sContext } | Should -Throw
 
         Assert-UserKubeconfigUnchanged
+    }
+
+    It 'repairs the user kubeconfig states observed on an affected machine (<Case>)' -ForEach @(
+        @{ Case = '0-byte config'; Content = '' }
+        @{ Case = '116-byte config with null clusters/users/contexts'; Content = "apiVersion: v1`nclusters: null`ncontexts: null`ncurrent-context: kubernetes-admin@k2s-cluster`nkind: Config`nusers: null`n" }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content $Content
+
+        Add-K8sContext
+
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:realKubectlExe | Out-Null
+        Get-FileBase64 $script:backupKubeconfig | Should -BeExactly $script:originalUserBytes
+        Assert-NoTemporaryFiles
+    }
+
+    It 'leaves the user kubeconfig unchanged when the K2s kubeconfig is truncated at <Cut>' -ForEach @(
+        @{ Cut = '10%' }, @{ Cut = '50%' }, @{ Cut = '90%' }, @{ Cut = 'client-key-data+400 (valid base64)' }, @{ Cut = 'client-key-data+401' }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $yaml = $script:utf8NoBom.GetString((Invoke-KubeconfigKubectl -KubectlPath $script:realKubectlExe -Arguments @('config', 'view', '--raw', '--kubeconfig', $script:k2sSourcePath)).StdOut)
+        $keyStart = $yaml.IndexOf('client-key-data: ') + 'client-key-data: '.Length
+        $length = switch ($Cut) {
+            '10%' { [int]($yaml.Length * 0.1) }
+            '50%' { [int]($yaml.Length * 0.5) }
+            '90%' { [int]($yaml.Length * 0.9) }
+            'client-key-data+400 (valid base64)' { $keyStart + 400 }
+            default { $keyStart + 401 }
+        }
+        Write-TestFile -Path $script:k2sSourcePath -Content $yaml.Substring(0, $length)
+
+        { Add-K8sContext } | Should -Throw '*KubeConfig*'
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'leaves the user kubeconfig unchanged when the K2s <Field> is <State> (parsed by real kubectl)' -ForEach @(
+        foreach ($f in @('certificate-authority-data', 'client-key-data')) {
+            foreach ($s in @('missing', 'null', 'empty')) { @{ Field = $f; State = $s } }
+        }
+    ) {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $cluster = New-K2sCluster 1
+        $user = New-K2sUser 1
+        $target = if ($Field -eq 'certificate-authority-data') { $cluster.cluster } else { $user.user }
+        switch ($State) {
+            'missing' { $target.Remove($Field) }
+            'null' { $target[$Field] = $null }
+            'empty' { $target[$Field] = '' }
+        }
+        Write-TestFile -Path $script:k2sSourcePath -Content (New-KubeconfigText -Clusters @($cluster) -Users @($user) -Contexts @(New-K2sContext) -CurrentContext $script:k2sContextName)
+
+        { Add-K8sContext } | Should -Throw "*has no $Field*"
+
+        Assert-UserKubeconfigUnchanged
+    }
+
+    It 'ignores a caller KUBECONFIG pointing to another file and leaves that file untouched' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $originalParsed = Get-KubeconfigObject -KubectlPath $script:realKubectlExe -Path $script:userKubeconfig
+        $decoy = Join-Path $script:testRoot 'decoy-config'
+        Write-TestFile -Path $decoy -Content (New-KubeconfigText -Clusters @([ordered]@{ name = 'decoy'; cluster = [ordered]@{ server = 'https://decoy:6443' } }) -Users @([ordered]@{ name = 'decoy'; user = [ordered]@{ token = 'decoy' } }) -Contexts @([ordered]@{ name = 'decoy'; context = [ordered]@{ cluster = 'decoy'; user = 'decoy' } }) -CurrentContext 'decoy')
+        $decoyBytes = Get-FileBase64 $decoy
+        $env:KUBECONFIG = $decoy
+
+        Add-K8sContext
+
+        Get-FileBase64 $decoy | Should -BeExactly $decoyBytes
+        $env:KUBECONFIG | Should -BeNullOrEmpty
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:realKubectlExe -OriginalParsed $originalParsed `
+            -ForeignContexts $script:foreignContextNames -ForeignClusters $script:foreignClusterNames -ForeignUsers $script:foreignUserNames | Out-Null
+    }
+
+    It 'does not write certificate, key or token data to the log' {
+        Initialize-ExistingUserKubeconfig -Content (New-UserKubeconfigText -CurrentContext $script:aksContextName -IncludeStaleK2s)
+        $script:logMessages = New-Object System.Collections.Generic.List[string]
+        Mock Write-Log { $script:logMessages.Add([string]$Message) }
+
+        Add-K8sContext
+
+        $secrets = foreach ($file in @($script:userKubeconfig, $script:backupKubeconfig, $script:k2sSourcePath)) {
+            $config = Get-KubeconfigObject -KubectlPath $script:realKubectlExe -Path $file
+            foreach ($entry in @($config.clusters | ForEach-Object { $_.cluster }) + @($config.users | ForEach-Object { $_.user })) {
+                foreach ($property in $entry.PSObject.Properties) {
+                    if ($property.Name -like '*-data' -or $property.Name -eq 'token') { $value = [string]$property.Value; $value.Substring([int]($value.Length / 2), [Math]::Min(24, $value.Length - [int]($value.Length / 2))) }
+                }
+            }
+        }
+        @($secrets).Count | Should -BeGreaterThan 0
+        $logText = $script:logMessages -join "`n"
+        $logText | Should -Match 'REDACTED|DATA\+OMITTED'
+        foreach ($secret in $secrets) { $logText.Contains($secret) | Should -BeFalse }
+    }
+
+    It 'preserves token, basic-auth, file-based and impersonation credentials of foreign entries' {
+        $clusters = @(
+            [ordered]@{ name = 'proxy-cluster'; cluster = [ordered]@{ server = 'https://api.example:6443'; 'insecure-skip-tls-verify' = $true; 'proxy-url' = 'http://proxy.example:3128'; 'tls-server-name' = 'api.internal' } },
+            [ordered]@{ name = 'file-ca-cluster'; cluster = [ordered]@{ server = 'https://files.example:6443'; 'certificate-authority' = 'C:\certs\ca.crt' } }
+        )
+        $users = @(
+            [ordered]@{ name = 'token-user'; user = [ordered]@{ token = 'synthetic-token-0123456789' } },
+            [ordered]@{ name = 'basic-user'; user = [ordered]@{ username = 'admin'; password = 'synthetic-password' } },
+            [ordered]@{ name = 'file-cert-user'; user = [ordered]@{ 'client-certificate' = 'C:\certs\client.crt'; 'client-key' = 'C:\certs\client.key' } },
+            [ordered]@{ name = 'impersonating-user'; user = [ordered]@{ token = 'synthetic-token-2'; as = 'someone'; 'as-groups' = @('g1', 'g2') } }
+        )
+        $contexts = @(
+            [ordered]@{ name = 'token'; context = [ordered]@{ cluster = 'proxy-cluster'; user = 'token-user'; namespace = 'ns-a' } },
+            [ordered]@{ name = 'basic'; context = [ordered]@{ cluster = 'proxy-cluster'; user = 'basic-user' } },
+            [ordered]@{ name = 'files'; context = [ordered]@{ cluster = 'file-ca-cluster'; user = 'file-cert-user'; namespace = 'ns-b' } },
+            [ordered]@{ name = 'impersonate'; context = [ordered]@{ cluster = 'file-ca-cluster'; user = 'impersonating-user' } }
+        )
+        Initialize-ExistingUserKubeconfig -Content (New-KubeconfigText -Clusters ($clusters + (New-K2sCluster 900)) -Users ($users + (New-K2sUser 900)) -Contexts ($contexts + (New-K2sContext)) -CurrentContext 'files')
+        $originalParsed = Get-KubeconfigObject -KubectlPath $script:realKubectlExe -Path $script:userKubeconfig
+
+        Add-K8sContext
+
+        Assert-UpdatedUserKubeconfig -KubectlPath $script:realKubectlExe -OriginalParsed $originalParsed `
+            -ForeignContexts @('token', 'basic', 'files', 'impersonate') -ForeignClusters @('proxy-cluster', 'file-ca-cluster') `
+            -ForeignUsers @('token-user', 'basic-user', 'file-cert-user', 'impersonating-user') | Out-Null
     }
 }

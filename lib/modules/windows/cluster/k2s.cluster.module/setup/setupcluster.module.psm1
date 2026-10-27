@@ -277,6 +277,77 @@ function Assert-MergedKubeconfig {
     }
 }
 
+<#
+.SYNOPSIS
+    Throws unless the K2s cluster and user carry complete, embedded base64-encoded PEM credentials.
+.DESCRIPTION
+    The K2s kubeconfig is kubeadm's admin.conf, which always embeds certificate-authority-data,
+    client-certificate-data and client-key-data; all three are mandatory. kubectl accepts a kubeconfig
+    truncated inside the last base64 value, so a partially copied '<install>\config' would otherwise
+    pass validation and be committed with corrupt credentials. Each value must decode to one or more
+    PEM blocks with matching BEGIN/END labels and a base64 body, and nothing outside the blocks:
+    certificates must be CERTIFICATE blocks, the key exactly one RSA/EC/PKCS#8 PRIVATE KEY block.
+#>
+function Assert-K2sCredentialData {
+    param(
+        [Parameter(Mandatory = $true)]
+        $K2sSource,
+        [Parameter(Mandatory = $true)]
+        [string] $ClusterName,
+        [Parameter(Mandatory = $true)]
+        [string] $UserName
+    )
+
+    $clusters = @($K2sSource.clusters | Where-Object { $null -ne $_ -and $_.name -ceq $ClusterName })
+    $users = @($K2sSource.users | Where-Object { $null -ne $_ -and $_.name -ceq $UserName })
+    foreach ($entry in @(@{ Kind = 'cluster'; Name = $ClusterName; Count = $clusters.Count }, @{ Kind = 'user'; Name = $UserName; Count = $users.Count })) {
+        if ($entry.Count -eq 0) {
+            throw "[KubeConfig] K2s kubeconfig has no $($entry.Kind) '$($entry.Name)'"
+        }
+        if ($entry.Count -gt 1) {
+            throw "[KubeConfig] K2s kubeconfig has duplicate $($entry.Kind) '$($entry.Name)'"
+        }
+    }
+    $fields = @(
+        @{ Owner = "cluster '$ClusterName'"; Data = $clusters[0].cluster; Name = 'certificate-authority-data'; Labels = @('CERTIFICATE'); SingleBlock = $false },
+        @{ Owner = "user '$UserName'"; Data = $users[0].user; Name = 'client-certificate-data'; Labels = @('CERTIFICATE'); SingleBlock = $false },
+        @{ Owner = "user '$UserName'"; Data = $users[0].user; Name = 'client-key-data'; Labels = @('RSA PRIVATE KEY', 'EC PRIVATE KEY', 'PRIVATE KEY'); SingleBlock = $true }
+    )
+    # Whole value = one or more BEGIN/END blocks with the same label (\k<label> is the label of the current block).
+    $pemPattern = '\A\s*(?:-----BEGIN (?<label>[A-Z0-9]+(?: [A-Z0-9]+)*)-----\r?\n(?<body>[A-Za-z0-9+/=\r\n]+?)-----END \k<label>-----\s*)+\z'
+    foreach ($field in $fields) {
+        $value = $null
+        if ($null -ne $field.Data -and $null -ne $field.Data.PSObject.Properties[$field.Name]) {
+            $value = $field.Data.($field.Name)
+        }
+        if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) {
+            throw "[KubeConfig] K2s kubeconfig $($field.Owner) has no $($field.Name); the file may be incomplete"
+        }
+        try {
+            $decoded = [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String([string]$value))
+        }
+        catch {
+            throw "[KubeConfig] K2s kubeconfig $($field.Owner) has invalid $($field.Name) (not base64); the file may be truncated"
+        }
+        $match = [regex]::Match($decoded, $pemPattern)
+        if (!$match.Success) {
+            throw "[KubeConfig] K2s kubeconfig $($field.Owner) has incomplete PEM data in $($field.Name) (missing, unterminated or mismatched BEGIN/END blocks); the file may be truncated"
+        }
+        $labels = @($match.Groups['label'].Captures | ForEach-Object { $_.Value })
+        if (($field.SingleBlock -and $labels.Count -ne 1) -or @($labels | Where-Object { $field.Labels -cnotcontains $_ }).Count -gt 0) {
+            throw "[KubeConfig] K2s kubeconfig $($field.Owner) has unexpected PEM blocks in $($field.Name) ($($labels -join ', ')); expected $(if ($field.SingleBlock) { 'one of' } else { 'only' }) $($field.Labels -join ' / ')"
+        }
+        foreach ($body in $match.Groups['body'].Captures) {
+            try {
+                $null = [System.Convert]::FromBase64String(($body.Value -replace '\s', ''))
+            }
+            catch {
+                throw "[KubeConfig] K2s kubeconfig $($field.Owner) has a corrupt PEM body in $($field.Name)"
+            }
+        }
+    }
+}
+
 function Write-KubeconfigStagingFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -295,15 +366,59 @@ function Write-KubeconfigStagingFile {
     }
 }
 
+function Invoke-KubeconfigFileReplace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StagingPath,
+        [Parameter(Mandatory = $true)]
+        [string] $Path,
+        [Parameter(Mandatory = $true)]
+        [string] $BackupPath
+    )
+
+    [System.IO.File]::Replace($StagingPath, $Path, $BackupPath)
+}
+
+function Test-KubeconfigFileUnchanged {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path,
+        [Parameter(Mandatory = $true)]
+        [byte[]] $OriginalBytes
+    )
+
+    try {
+        $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    }
+    catch {
+        return $false
+    }
+    try {
+        $buffer = New-Object System.IO.MemoryStream
+        $stream.CopyTo($buffer)
+        $currentBytes = $buffer.ToArray()
+    }
+    finally {
+        $stream.Dispose()
+    }
+    return ($currentBytes.Length -eq $OriginalBytes.Length) -and ([System.Convert]::ToBase64String($currentBytes) -ceq [System.Convert]::ToBase64String($OriginalBytes))
+}
+
 <#
 .SYNOPSIS
     Replaces the user kubeconfig with the validated staging file.
 .DESCRIPTION
     Staging and target are in the same directory, so the operation is a rename on the same volume.
     An existing target is swapped with File.Replace (ReplaceFile), which keeps the target's ACL and
-    attributes and moves the previous content to BackupPath. The target is re-read immediately
-    before the swap to detect concurrent modification. A target that does not exist is created with
-    File.Move, which fails instead of overwriting if another process created it in the meantime.
+    attributes and moves the previous content to BackupPath. The target is opened with
+    FileShare.Read|Delete and compared with the original bytes; the handle is held until the swap,
+    so in-place writers are blocked between check and swap. Writers that replace the file by rename
+    are not blocked (remaining race window). If ReplaceFile fails after it already moved the target
+    to BackupPath (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2), the original is moved back. Transient IO errors
+    that leave the target untouched (e.g. ERROR_UNABLE_TO_REMOVE_REPLACED while a scanner briefly holds
+    the file) are retried up to ReplaceAttempts times after re-checking that the target is unchanged.
+    A target that does not exist is created with File.Move, which fails instead of overwriting if
+    another process created it in the meantime.
 #>
 function Publish-KubeconfigFile {
     param(
@@ -315,7 +430,10 @@ function Publish-KubeconfigFile {
         [string] $BackupPath,
         [Parameter(Mandatory = $false)]
         [AllowNull()]
-        [byte[]] $OriginalBytes
+        [byte[]] $OriginalBytes,
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 20)]
+        [int] $ReplaceAttempts = 5
     )
 
     if ($null -eq $OriginalBytes) {
@@ -326,11 +444,74 @@ function Publish-KubeconfigFile {
         return
     }
 
-    $currentBytes = [System.IO.File]::ReadAllBytes($Path)
-    if (($currentBytes.Length -ne $OriginalBytes.Length) -or ([System.Convert]::ToBase64String($currentBytes) -cne [System.Convert]::ToBase64String($OriginalBytes))) {
-        throw "[KubeConfig] '$Path' was modified by another process during the update; it was left unchanged"
+    try {
+        $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete))
     }
-    [System.IO.File]::Replace($StagingPath, $Path, $BackupPath)
+    catch {
+        throw "[KubeConfig] '$Path' is in use by another process; it was left unchanged: $($_.Exception.Message)"
+    }
+    $replaceError = $null
+    try {
+        $buffer = New-Object System.IO.MemoryStream
+        $stream.CopyTo($buffer)
+        $currentBytes = $buffer.ToArray()
+        if (($currentBytes.Length -ne $OriginalBytes.Length) -or ([System.Convert]::ToBase64String($currentBytes) -cne [System.Convert]::ToBase64String($OriginalBytes))) {
+            throw "[KubeConfig] '$Path' was modified by another process during the update; it was left unchanged"
+        }
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            try {
+                Invoke-KubeconfigFileReplace -StagingPath $StagingPath -Path $Path -BackupPath $BackupPath
+                $replaceError = $null
+                break
+            }
+            catch {
+                $replaceError = $_
+            }
+            $cause = $replaceError.Exception
+            if ($cause -is [System.Management.Automation.MethodInvocationException] -and $null -ne $cause.InnerException) {
+                $cause = $cause.InnerException
+            }
+            # Only transient IO errors (e.g. ERROR_UNABLE_TO_REMOVE_REPLACED while a scanner briefly holds the
+            # target) are retried, and only while nothing has been moved yet.
+            if ($attempt -ge $ReplaceAttempts -or $cause -isnot [System.IO.IOException] -or
+                ![System.IO.File]::Exists($Path) -or ![System.IO.File]::Exists($StagingPath)) {
+                break
+            }
+            if (!(Test-KubeconfigFileUnchanged -Path $Path -OriginalBytes $OriginalBytes)) {
+                throw "[KubeConfig] '$Path' was modified by another process during the update; it was left unchanged"
+            }
+            Write-Log "[KubeConfig] replacing '$Path' failed (attempt $attempt of $ReplaceAttempts), retrying: $($cause.Message)"
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+    if ($null -eq $replaceError) {
+        return
+    }
+
+    $reason = $replaceError.Exception.Message
+    if ([System.IO.File]::Exists($Path)) {
+        throw "[KubeConfig] replacing '$Path' failed; it was left unchanged: $reason"
+    }
+    if (![System.IO.File]::Exists($BackupPath)) {
+        throw "[KubeConfig] replacing '$Path' failed and neither '$Path' nor '$BackupPath' exists: $reason"
+    }
+    # Only move the backup back if ReplaceFile actually moved the original there; otherwise (e.g. the target
+    # was deleted by another process) BackupPath still holds an older backup and must not be presented as the original.
+    if (!(Test-KubeconfigFileUnchanged -Path $BackupPath -OriginalBytes $OriginalBytes)) {
+        throw "[KubeConfig] replacing '$Path' failed, '$Path' no longer exists and '$BackupPath' does not hold its original content; nothing was restored: $reason"
+    }
+    try {
+        [System.IO.File]::Move($BackupPath, $Path)
+    }
+    catch {
+        throw "[KubeConfig] replacing '$Path' failed ($reason) and the original could not be moved back; it is preserved in '$BackupPath': $($_.Exception.Message)"
+    }
+    throw "[KubeConfig] replacing '$Path' failed; the original was restored: $reason"
 }
 
 <#
@@ -365,6 +546,7 @@ function Add-K8sContext {
             throw "[KubeConfig] K2s kubeconfig '$sourcePath' is missing or empty"
         }
         $k2sSource = Get-KubeconfigObject -KubectlPath $kubectl -Path $sourcePath
+        Assert-K2sCredentialData -K2sSource $k2sSource -ClusterName $clusterName -UserName $userName
 
         $originalBytes = $null
         $originalConfig = $null
@@ -372,6 +554,11 @@ function Add-K8sContext {
         if (Test-Path -LiteralPath $userConfigPath) {
             $originalBytes = [System.IO.File]::ReadAllBytes($userConfigPath)
             $originalConfig = Get-KubeconfigObject -KubectlPath $kubectl -Path $userConfigPath
+            foreach ($context in @($originalConfig.contexts | Where-Object { $null -ne $_ -and $_.name -cne $contextName })) {
+                if ($context.context.cluster -ceq $clusterName -or $context.context.user -ceq $userName) {
+                    Write-Log "[KubeConfig] Warning: context '$($context.name)' references cluster '$($context.context.cluster)' / user '$($context.context.user)'; entries named '$clusterName' / '$userName' are replaced with the K2s entries" -Console
+                }
+            }
 
             # Remove existing K2s entries from a private copy in the same directory (relative paths keep resolving).
             [System.IO.File]::WriteAllBytes($strippedPath, $originalBytes)
